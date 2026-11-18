@@ -12,9 +12,10 @@ plugins {
 val envKs = System.getenv("KEYSTORE_FILE")?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
 val builtinKs = rootProject.file("signing/chargefloat.jks").takeIf { it.exists() }
 val ksFile = envKs ?: builtinKs
-val ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "android"
-val ksKeyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
-val ksKeyPass = System.getenv("KEY_PASSWORD") ?: ksStorePass
+// 注意：GitHub Actions 未配置的 Secret 会注入空字符串，这里必须按「空串也算未设置」处理
+val ksStorePass = System.getenv("KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() } ?: "android"
+val ksKeyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "androiddebugkey"
+val ksKeyPass = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: ksStorePass
 val hasReleaseKey = ksFile != null
 
 android {
