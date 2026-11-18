@@ -51,7 +51,7 @@ export ANDROID_HOME=/path/to/android-sdk
 # 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
-构建脚本从环境变量读取签名信息，未提供时自动回退到 debug 签名，任何环境下都能出包：
+release 包用仓库内的 `signing/chargefloat.jks` 签名，所以本地和 CI 出的包签名一致，可以直接覆盖安装。签名取值顺序是：环境变量 → 仓库内置密钥 → debug 签名。
 
 | 变量 | 说明 |
 | --- | --- |
@@ -70,7 +70,9 @@ export ANDROID_HOME=/path/to/android-sdk
 git tag v1.2 && git push origin v1.2
 ```
 
-签名密钥存放在仓库 Secrets 中，需要在 **Settings → Secrets and variables → Actions** 配置：
+签名默认使用仓库内置的 `signing/chargefloat.jks`（即 Android 标准 debug key，公开不构成额外风险，适合自用分发）。
+
+如果想换成自己的独立密钥，在 **Settings → Secrets and variables → Actions** 添加下面几项即可，CI 会优先使用它们，仓库里的那份不用删：
 
 | Secret | 内容 |
 | --- | --- |
@@ -79,7 +81,7 @@ git tag v1.2 && git push origin v1.2
 | `KEY_ALIAS` | 密钥别名 |
 | `KEY_PASSWORD` | 密钥密码 |
 
-未配置时 CI 仍能构建成功，只是产物使用 runner 临时生成的 debug 签名，**无法覆盖安装已有版本**。
+> 换密钥后签名会变，手机上必须先卸载旧版再装。
 
 > 国内网络本地构建慢的话，可把 `gradle/wrapper/gradle-wrapper.properties` 里的 `distributionUrl` 换成腾讯镜像 `https://mirrors.cloud.tencent.com/gradle/gradle-8.7-bin.zip`。
 

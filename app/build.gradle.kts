@@ -5,13 +5,17 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// 签名信息由环境变量注入（GitHub Actions 用 Secrets 提供）；
-// 本地或未配置时自动回退到 debug 签名，保证任何环境下都能出包。
-val ksPath = System.getenv("KEYSTORE_FILE")
-val ksStorePass = System.getenv("KEYSTORE_PASSWORD")
-val ksKeyAlias = System.getenv("KEY_ALIAS") ?: "chargefloat"
+// 签名取值顺序：
+//   1. 环境变量 KEYSTORE_FILE（CI 可改用 Secrets 注入）
+//   2. 仓库内置的 signing/chargefloat.jks（保证 CI 与本地构建签名一致）
+//   3. 都没有则回退 debug 签名
+val envKs = System.getenv("KEYSTORE_FILE")?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
+val builtinKs = rootProject.file("signing/chargefloat.jks").takeIf { it.exists() }
+val ksFile = envKs ?: builtinKs
+val ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+val ksKeyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
 val ksKeyPass = System.getenv("KEY_PASSWORD") ?: ksStorePass
-val hasReleaseKey = !ksPath.isNullOrBlank() && File(ksPath).exists() && !ksStorePass.isNullOrBlank()
+val hasReleaseKey = ksFile != null
 
 android {
     namespace = "com.k80.chargefloat"
@@ -20,7 +24,7 @@ android {
     signingConfigs {
         if (hasReleaseKey) {
             create("release") {
-                storeFile = File(ksPath!!)
+                storeFile = ksFile
                 storePassword = ksStorePass
                 keyAlias = ksKeyAlias
                 keyPassword = ksKeyPass
@@ -32,8 +36,8 @@ android {
         applicationId = "com.k80.chargefloat"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         resourceConfigurations += listOf("zh", "en")
     }
 

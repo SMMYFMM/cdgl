@@ -17,10 +17,11 @@ captures/
 *.ap_
 *.dex
 
-# 签名文件（CI 通过 Secrets 注入，本地请勿提交）
+# 签名文件（仓库内置的 signing/chargefloat.jks 除外）
 *.jks
 *.keystore
 keystore.properties
+!signing/chargefloat.jks
 
 # 系统
 .DS_Store
