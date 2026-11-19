@@ -25,6 +25,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".LayoutActivity"
+            android:exported="false"
+            android:label="内容与排版" />
+
         <service
             android:name=".FloatService"
             android:exported="false"
@@ -32,6 +37,17 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="floating real-time battery charge power display" />
+        </service>
+
+        <service
+            android:name=".ChargeTile"
+            android:exported="true"
+            android:icon="@drawable/ic_bolt"
+            android:label="@string/tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
         </service>
 
         <receiver

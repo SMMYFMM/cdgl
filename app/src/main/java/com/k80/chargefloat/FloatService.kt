@@ -5,40 +5,48 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
+import android.os.PowerManager
 import android.provider.Settings
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import java.util.Locale
+import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
 /**
- * 悬浮窗前台服务：每秒采样一次，把功率画在屏幕上。
+ * 悬浮窗前台服务。
+ *
+ * 功耗控制：
+ *  - 息屏时不再画界面（也看不见），采样间隔放宽到 20 秒，只维持统计积分；
+ *  - 内容没变化不调用 updateViewLayout，避免每秒一次的跨进程窗口刷新；
+ *  - 采样回调没有 wakelock，设备睡着时自然不执行，不会为了刷新把手机唤醒。
  */
 class FloatService : Service() {
 
     companion object {
         const val CHANNEL_ID = "float_window"
         const val NOTIFICATION_ID = 4101
+
+        /** 息屏后的采样间隔 */
+        private const val IDLE_SAMPLE_MS = 20_000L
 
         @Volatile
         var running = false
@@ -48,12 +56,10 @@ class FloatService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var prefs: Prefs
     private lateinit var reader: PowerReader
+    private lateinit var renderer: OverlayRenderer
+    private var spec: LayoutSpec? = null
 
-    private var root: LinearLayout? = null
-    private var rowLayout: LinearLayout? = null
-    private var tvPower: TextView? = null
-    private var tvDetail: TextView? = null
-    private var tvSession: TextView? = null
+    private var root: View? = null
     private var lp: WindowManager.LayoutParams? = null
 
     private lateinit var worker: HandlerThread
@@ -61,10 +67,42 @@ class FloatService : Service() {
     private val ui = Handler(Looper.getMainLooper())
 
     private var active = false
+
+    @Volatile
+    private var interactive = true
+
     private var lastSnapshot: Snapshot? = null
 
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    interactive = true
+                    if (active) {
+                        bg.removeCallbacks(sampler)
+                        bg.post(sampler)
+                    }
+                }
+
+                Intent.ACTION_SCREEN_OFF -> interactive = false
+            }
+        }
+    }
+
     private val prefsWatcher = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        ui.post { lastSnapshot?.let { render(it) } }
+        spec = LayoutSpec.load(prefs)
+        ui.post {
+            if (!active) return@post
+            val cfg = spec
+            val snap = lastSnapshot
+            if (cfg != null && snap != null) {
+                renderer.invalidate()
+                if (renderer.render(snap, PowerBus.stats, prefs, cfg, !prefs.showDetail)) {
+                    relayout()
+                }
+            }
+            applyBackground()
+        }
     }
 
     private val sampler = object : Runnable {
@@ -72,10 +110,15 @@ class FloatService : Service() {
             if (!active) return
             val snap = runCatching { reader.read() }.getOrNull()
             if (snap != null) {
-                PowerBus.publish(snap, reader.stats())
-                ui.post { render(snap) }
+                val st = reader.stats()
+                PowerBus.publish(snap, st)
+                lastSnapshot = snap
+                // 息屏时不碰界面，只让统计继续
+                if (interactive) ui.post { if (active) draw(snap, st) }
             }
-            bg.postDelayed(this, prefs.sampleMs.toLong().coerceIn(300L, 5000L))
+            val delay = if (interactive) prefs.sampleMs.toLong().coerceIn(300L, 10_000L)
+            else IDLE_SAMPLE_MS
+            bg.postDelayed(this, delay)
         }
     }
 
@@ -84,10 +127,22 @@ class FloatService : Service() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         prefs = Prefs(this)
         reader = PowerReader(this)
+        spec = LayoutSpec.load(prefs)
+        renderer = OverlayRenderer(this)
         worker = HandlerThread("power-sampler").also { it.start() }
         bg = Handler(worker.looper)
+        interactive = (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
         createChannel()
         prefs.raw().registerOnSharedPreferenceChangeListener(prefsWatcher)
+        ContextCompat.registerReceiver(
+            this,
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -118,9 +173,8 @@ class FloatService : Service() {
         running = false
         bg.removeCallbacksAndMessages(null)
         prefs.raw().unregisterOnSharedPreferenceChangeListener(prefsWatcher)
-        root?.let { v ->
-            runCatching { wm.removeView(v) }
-        }
+        runCatching { unregisterReceiver(screenReceiver) }
+        root?.let { v -> runCatching { wm.removeView(v) } }
         root = null
         PowerBus.clear()
         worker.quitSafely()
@@ -139,80 +193,44 @@ class FloatService : Service() {
             gravity = Gravity.START
             setPadding(dp(10), dp(5), dp(10), dp(6))
         }
+        container.addView(
+            renderer.view,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
 
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.START
-            isBaselineAligned = true
-        }
-        rowLayout = row
-
-        tvPower = TextView(this).apply {
-            gravity = Gravity.START
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            includeFontPadding = false
-            setShadowLayer(dp(4).toFloat(), 0f, dp(1).toFloat(), 0x66000000)
-            setTextColor(Color.WHITE)
-            text = "--.- W"
-        }
-        tvDetail = TextView(this).apply {
-            gravity = Gravity.START
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(0xCCFFFFFF.toInt())
-            includeFontPadding = false
-        }
-        tvSession = TextView(this).apply {
-            gravity = Gravity.START
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            setTextColor(0x99FFFFFF.toInt())
-            includeFontPadding = false
-        }
-
-        row.addView(tvPower, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        row.addView(tvDetail, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(1) })
-
-        container.addView(row, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        container.addView(tvSession, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(1) })
-
-        val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        val dm = resources.displayMetrics
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            val dm = resources.displayMetrics
             x = if (prefs.posX >= 0) prefs.posX.coerceIn(0, (dm.widthPixels - dp(60)).coerceAtLeast(0))
             else (dm.widthPixels - dp(150)).coerceAtLeast(0)
             y = if (prefs.posY >= 0) prefs.posY.coerceIn(0, (dm.heightPixels - dp(60)).coerceAtLeast(0))
             else dp(120)
         }
 
-        container.background = panelBackground(prefs.bgAlpha)
-
+        applyBackground(container)
         attachDrag(container, params)
 
         root = container
         lp = params
         runCatching { wm.addView(container, params) }
 
-        lastSnapshot?.let { render(it) }
+        lastSnapshot?.let { draw(it, PowerBus.stats) }
+    }
+
+    private fun applyBackground(target: View? = root) {
+        val v = target ?: return
+        v.background = panelBackground(prefs.bgAlpha)
     }
 
     private fun attachDrag(view: View, params: WindowManager.LayoutParams) {
@@ -253,9 +271,9 @@ class FloatService : Service() {
 
                     MotionEvent.ACTION_UP -> {
                         if (!moved) {
-                            // 单击：临时收起/展开详情
+                            // 单击：折叠成只显示第一行
                             prefs.showDetail = !prefs.showDetail
-                            lastSnapshot?.let { render(it) }
+                            lastSnapshot?.let { draw(it, PowerBus.stats) }
                         } else if (!prefs.locked) {
                             prefs.posX = params.x
                             prefs.posY = params.y
@@ -268,85 +286,14 @@ class FloatService : Service() {
         })
     }
 
-    private fun render(s: Snapshot) {
-        lastSnapshot = s
-        val p = prefs
-        val powerView = tvPower ?: return
-        val detailView = tvDetail ?: return
-        val sessionView = tvSession ?: return
+    private fun draw(s: Snapshot, st: SessionStats) {
+        if (!active) return
+        val cfg = spec ?: return
+        if (renderer.render(s, st, prefs, cfg, !prefs.showDetail)) relayout()
+    }
 
-        val color = when {
-            s.charging -> p.chargeColor
-            s.plugged -> p.idleColor
-            else -> p.dischargeColor
-        }
-
-        val value = if (abs(s.watts) < 0.12f) 0f else abs(s.watts)
-        val num = String.format(Locale.US, "%.${p.decimals}f", value)
-        val prefix = if (s.charging && value >= 0.1f) "+" else ""
-        powerView.text = if (s.valid) "$prefix$num W" else "--.- W"
-        powerView.setTextColor(if (s.valid) color else 0xFF9AA0AA.toInt())
-        powerView.setTextSize(TypedValue.COMPLEX_UNIT_SP, p.fontSize.toFloat())
-        powerView.minWidth = 0
-
-        val style = p.layoutStyle
-        val compact = style == 0
-        rowLayout?.let { row ->
-            row.orientation = if (compact) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            row.gravity = if (compact) Gravity.START or Gravity.CENTER_VERTICAL else Gravity.START
-            row.isBaselineAligned = compact
-        }
-        (detailView.layoutParams as? LinearLayout.LayoutParams)?.let { dlp ->
-            if (compact) {
-                dlp.leftMargin = dp(7)
-                dlp.topMargin = 0
-            } else {
-                dlp.leftMargin = 0
-                dlp.topMargin = dp(1)
-            }
-            detailView.layoutParams = dlp
-        }
-
-        val line1 = ArrayList<String>(4)
-        if (p.showDetail) {
-            if (s.voltage > 0.1f) line1.add(String.format(Locale.US, "%.2fV", s.voltage))
-            if (s.valid) line1.add(String.format(Locale.US, "%.2fA", abs(s.current)))
-        }
-        if (p.showBattery) {
-            if (s.percent in 0..100) line1.add("${s.percent}%")
-            if (!s.tempC.isNaN()) line1.add(String.format(Locale.US, "%.1f℃", s.tempC))
-        }
-        detailView.text = line1.joinToString(" · ")
-        val small = (p.fontSize * 0.32f).coerceAtLeast(7f)
-        detailView.setTextSize(TypedValue.COMPLEX_UNIT_SP, small)
-        detailView.visibility = if (line1.isEmpty()) View.GONE else View.VISIBLE
-
-        if (style == 2) {
-            val st = PowerBus.stats
-            val line2 = ArrayList<String>(3)
-            line2.add(s.statusText.ifEmpty { "—" })
-            if (p.showSession && st.millis > 0) {
-                line2.add(String.format(Locale.US, "峰值%.0fW", st.peakW))
-                line2.add(String.format(Locale.US, "%.1fWh", st.wh))
-                val min = st.millis / 60000L
-                if (min >= 1) line2.add("${min}分")
-            }
-            sessionView.text = line2.joinToString(" · ")
-            sessionView.setTextSize(TypedValue.COMPLEX_UNIT_SP, (small * 0.88f).coerceAtLeast(6.5f))
-            sessionView.visibility = View.VISIBLE
-        } else {
-            sessionView.visibility = View.GONE
-        }
-
-        (root?.background as? GradientDrawable)?.let { g ->
-            g.setColor(Color.argb((p.bgAlpha * 255 / 100).coerceIn(0, 255), 8, 8, 12))
-            g.cornerRadius = dp(12).toFloat()
-        }
-
-        root?.let { v ->
-            v.requestLayout()
-            lp?.let { params -> runCatching { wm.updateViewLayout(v, params) } }
-        }
+    private fun relayout() {
+        root?.let { v -> lp?.let { p -> runCatching { wm.updateViewLayout(v, p) } } }
     }
 
     private fun panelBackground(alphaPercent: Int): GradientDrawable {

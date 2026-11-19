@@ -3,10 +3,13 @@ package com.k80.chargefloat
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.app.StatusBarManager
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -51,10 +54,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var seekAlpha: SeekBar
     private lateinit var rgDecimals: RadioGroup
     private lateinit var rgInterval: RadioGroup
-    private lateinit var rgLayout: RadioGroup
-    private lateinit var swDetail: MaterialSwitch
-    private lateinit var swBattery: MaterialSwitch
-    private lateinit var swSession: MaterialSwitch
     private lateinit var swLock: MaterialSwitch
     private lateinit var swBoot: MaterialSwitch
     private lateinit var swRoot: MaterialSwitch
@@ -97,6 +96,10 @@ class MainActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.btnBatteryOpt).setOnClickListener { requestBattery() }
         findViewById<MaterialButton>(R.id.btnMiui).setOnClickListener { openMiuiPermissions() }
         findViewById<MaterialButton>(R.id.btnDiag).setOnClickListener { showDiagnose() }
+        findViewById<MaterialButton>(R.id.btnLayout).setOnClickListener {
+            startActivity(Intent(this, LayoutActivity::class.java))
+        }
+        findViewById<MaterialButton>(R.id.btnTile).setOnClickListener { addQuickTile() }
     }
 
     private fun bindViews() {
@@ -113,10 +116,6 @@ class MainActivity : AppCompatActivity() {
         seekAlpha = findViewById(R.id.seekAlpha)
         rgDecimals = findViewById(R.id.rgDecimals)
         rgInterval = findViewById(R.id.rgInterval)
-        rgLayout = findViewById(R.id.rgLayout)
-        swDetail = findViewById(R.id.swDetail)
-        swBattery = findViewById(R.id.swBattery)
-        swSession = findViewById(R.id.swSession)
         swLock = findViewById(R.id.swLock)
         swBoot = findViewById(R.id.swBoot)
         swRoot = findViewById(R.id.swRoot)
@@ -156,19 +155,6 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(bar: SeekBar) = Unit
         })
 
-        when (prefs.layoutStyle) {
-            0 -> rgLayout.check(R.id.rbLayoutCompact)
-            1 -> rgLayout.check(R.id.rbLayoutTwo)
-            else -> rgLayout.check(R.id.rbLayoutThree)
-        }
-        rgLayout.setOnCheckedChangeListener { _, id ->
-            prefs.layoutStyle = when (id) {
-                R.id.rbLayoutCompact -> 0
-                R.id.rbLayoutTwo -> 1
-                else -> 2
-            }
-        }
-
         when (prefs.decimals) {
             0 -> rgDecimals.check(R.id.rbDec0)
             1 -> rgDecimals.check(R.id.rbDec1)
@@ -195,12 +181,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        swDetail.isChecked = prefs.showDetail
-        swDetail.setOnCheckedChangeListener { _, checked -> prefs.showDetail = checked }
-        swBattery.isChecked = prefs.showBattery
-        swBattery.setOnCheckedChangeListener { _, checked -> prefs.showBattery = checked }
-        swSession.isChecked = prefs.showSession
-        swSession.setOnCheckedChangeListener { _, checked -> prefs.showSession = checked }
         swLock.isChecked = prefs.locked
         swLock.setOnCheckedChangeListener { _, checked -> prefs.locked = checked }
         swBoot.isChecked = prefs.bootStart
@@ -270,15 +250,16 @@ class MainActivity : AppCompatActivity() {
         if (!s.tempC.isNaN()) parts.add(String.format(Locale.US, "%.1f ℃", s.tempC))
         tvSub.text = if (parts.isEmpty()) "电压 --  ·  电流 --" else parts.joinToString("  ·  ")
 
-        tvSession.text = if (st.millis > 0) {
-            val minutes = st.millis / 60_000L
+        tvSession.text = if (st.millis > 3000) {
+            val minutes = (st.millis / 60_000L).coerceAtLeast(1L)
             String.format(
                 Locale.US,
-                "本次充电：峰值 %.1fW · 平均 %.1fW · 充入 %.2fWh · %d 分钟",
-                st.peakW, st.avgW, st.wh, minutes
+                "%s：平均 %.1fW · 峰值 %.1fW · %.2fWh · %d 分钟",
+                if (st.charging) "本次充电" else "本次使用",
+                st.avgW, st.peakW, st.wh, minutes
             )
         } else {
-            "本次充电：暂无记录"
+            "本次统计：暂无记录"
         }
 
         tvSource.text = if (s.valid) {
@@ -332,6 +313,42 @@ class MainActivity : AppCompatActivity() {
             !Settings.canDrawOverlays(this) -> "需要先授予「显示在其他应用上层」权限"
             else -> "开启后回到桌面或任意 App 内都能看到实时功率"
         }
+    }
+
+    // ---------------------------------------------------------------- 状态栏开关
+
+    private fun addQuickTile() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val sbm = getSystemService(StatusBarManager::class.java)
+            if (sbm != null) {
+                runCatching { sbm.requestAddTileService(
+                    ComponentName(this, ChargeTile::class.java),
+                    getString(R.string.tile_label),
+                    Icon.createWithResource(this, R.drawable.ic_bolt),
+                    mainExecutor
+                ) { result ->
+                    if (result == StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_NOT_ADDED) {
+                        Toast.makeText(
+                            this,
+                            "已取消添加，可稍后在控制中心编辑页手动添加",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } }.onFailure {
+                    Toast.makeText(
+                        this,
+                        "系统不允许自动添加，请下拉状态栏 → 编辑 → 手动拖入「功率悬浮」",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                return
+            }
+        }
+        Toast.makeText(
+            this,
+            "当前系统需要手动添加：下拉状态栏 → 编辑按钮 → 把「功率悬浮」拖到常用区",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     // ---------------------------------------------------------------- 权限

@@ -42,7 +42,22 @@ class Prefs(context: Context) {
         get() = sp.getInt("decimals", 1).coerceIn(0, 2)
         set(value) = sp.edit().putInt("decimals", value.coerceIn(0, 2)).apply()
 
-    /** 悬浮窗布局：0=单行 1=两行 2=详细 */
+    /** 悬浮窗排版（JSON）。空表示还没设置过，首次会按旧设置迁移 */
+    var layoutSpec: String
+        get() = sp.getString("layout_spec", "") ?: ""
+        set(value) = sp.edit().putString("layout_spec", value).apply()
+
+    /** 副行字号相对主字号的百分比 20..100 */
+    var rowScale: Int
+        get() = sp.getInt("row_scale", 32).coerceIn(20, 100)
+        set(value) = sp.edit().putInt("row_scale", value.coerceIn(20, 100)).apply()
+
+    /** 所有行统一用主字号 */
+    var uniformSize: Boolean
+        get() = sp.getBoolean("uniform_size", false)
+        set(value) = sp.edit().putBoolean("uniform_size", value).apply()
+
+    /** 旧版布局：0=单行 1=两行 2=详细（仅用于迁移） */
     var layoutStyle: Int
         get() = sp.getInt("layout_style", 1).coerceIn(0, 2)
         set(value) = sp.edit().putInt("layout_style", value.coerceIn(0, 2)).apply()

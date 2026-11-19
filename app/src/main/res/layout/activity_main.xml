@@ -148,6 +148,15 @@
                     android:layout_marginTop="12dp"
                     android:text="开启悬浮窗"
                     android:textSize="15sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnTile"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="添加到状态栏快捷开关"
+                    android:textSize="14sp" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -174,46 +183,14 @@
                     android:layout_height="wrap_content"
                     android:text="显示设置" />
 
-                <TextView
-                    style="@style/Label"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:text="悬浮窗布局" />
-
-                <RadioGroup
-                    android:id="@+id/rgLayout"
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnLayout"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal">
-
-                    <RadioButton
-                        android:id="@+id/rbLayoutCompact"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="单行"
-                        android:textColor="@color/textPrimary"
-                        android:textSize="13sp" />
-
-                    <RadioButton
-                        android:id="@+id/rbLayoutTwo"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="两行"
-                        android:textColor="@color/textPrimary"
-                        android:textSize="13sp" />
-
-                    <RadioButton
-                        android:id="@+id/rbLayoutThree"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="详细"
-                        android:textColor="@color/textPrimary"
-                        android:textSize="13sp" />
-                </RadioGroup>
+                    android:layout_marginTop="12dp"
+                    android:text="内容与排版（显示哪些 / 分几行 / 逐项配色）"
+                    android:textSize="13sp" />
 
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -379,30 +356,12 @@
                         android:paddingBottom="2dp" />
                 </HorizontalScrollView>
 
-                <com.google.android.material.materialswitch.MaterialSwitch
-                    android:id="@+id/swDetail"
+                <TextView
+                    style="@style/Label"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:text="显示电压 / 电流"
-                    android:textColor="@color/textPrimary"
-                    android:textSize="14sp" />
-
-                <com.google.android.material.materialswitch.MaterialSwitch
-                    android:id="@+id/swBattery"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="显示电量 / 温度"
-                    android:textColor="@color/textPrimary"
-                    android:textSize="14sp" />
-
-                <com.google.android.material.materialswitch.MaterialSwitch
-                    android:id="@+id/swSession"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="显示本次充电统计"
-                    android:textColor="@color/textPrimary"
-                    android:textSize="14sp" />
+                    android:text="显示哪些字段、每一项的颜色、以及行与行之间的先后，都在上面「内容与排版」里单独设置。" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

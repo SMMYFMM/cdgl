@@ -64,7 +64,9 @@ class PowerReader(private val context: Context) {
     private var sessionWh = 0f
     private var sessionCharging = false
     private var sessionStartPercent = -1
+    private var sessionActive = false
     private var lastSession = SessionStats()
+    private var lastCharge = SessionStats()
 
     /** 缓存：这台机器上 root 是否可用（只检测一次，且只在用户开启开关后才检测） */
     private val rootAvailable: Boolean by lazy { prefs.useRoot && probeRoot() }
@@ -166,7 +168,11 @@ class PowerReader(private val context: Context) {
         )
     }
 
+    /** 当前统计窗口 */
     fun stats(): SessionStats = lastSession
+
+    /** 上一次完整的充电统计（拔掉充电器后仍然可查） */
+    fun lastChargeStats(): SessionStats = lastCharge
 
     /** 输入侧功率（充电器到手机），多数机型读不到就返回 NaN */
     fun inputWatts(): Float {
@@ -181,43 +187,53 @@ class PowerReader(private val context: Context) {
 
     // ---------------------------------------------------------------- 统计
 
+    /**
+     * 统计窗口：插上/拔掉充电器都会开一个新窗口。
+     * 充电时窗口就是"本次充电"，放电时就是"本次使用"，平均功率两种场景都成立。
+     */
     private fun updateSession(charging: Boolean, magnitude: Float, percent: Int) {
         val now = SystemClock.elapsedRealtime()
-        if (charging) {
-            if (!sessionCharging) {
-                sessionStartTs = now
-                sessionStartPercent = percent
-                sessionPeak = 0f
-                sessionSum = 0f
-                sessionCount = 0
-                sessionWh = 0f
-                sessionCharging = true
+
+        if (!sessionActive || charging != sessionCharging) {
+            // 充电刚结束：把这一轮充电的完整统计留一份
+            if (sessionActive && sessionCharging && !charging) {
+                lastCharge = lastSession.copy(charging = false, endPercent = percent)
             }
-            if (lastSampleTs > 0 && now - lastSampleTs in 1..10_000) {
-                val dt = (now - lastSampleTs) / 1000f
-                sessionWh += magnitude * dt / 3600f
-            }
-            sessionPeak = max(sessionPeak, magnitude)
-            sessionSum += magnitude
-            sessionCount++
-            lastSession = SessionStats(
-                charging = true,
-                peakW = sessionPeak,
-                avgW = if (sessionCount > 0) sessionSum / sessionCount else 0f,
-                wh = sessionWh,
-                millis = now - sessionStartTs,
-                startPercent = sessionStartPercent,
-                endPercent = percent
-            )
-            lastSampleTs = now
-        } else {
-            if (sessionCharging) {
-                // 拔掉充电器：冻结上一次充电的统计，并把结束电量补上
-                sessionCharging = false
-                lastSession = lastSession.copy(charging = false, endPercent = percent)
-            }
-            lastSampleTs = now
+            sessionActive = true
+            sessionCharging = charging
+            sessionStartTs = now
+            sessionStartPercent = percent
+            sessionPeak = 0f
+            sessionSum = 0f
+            sessionCount = 0
+            sessionWh = 0f
+            lastSampleTs = 0L
         }
+
+        val dt = if (lastSampleTs > 0) now - lastSampleTs else 0L
+        // 息屏时采样间隔会拉长到 20 秒，这里留出余量，避免把电量积分丢掉
+        if (dt in 1..65_000L) {
+            sessionWh += magnitude * dt / 1000f / 3600f
+        } else if (dt > 65_000L && sessionCount > 0) {
+            // 设备休眠期间回调不会执行，醒来后按窗口均值补上这段时间，避免统计少算一大截。
+            // 不为了统计去唤醒设备，精度用均值近似。
+            val avg = sessionSum / sessionCount
+            val capped = dt.coerceAtMost(6 * 3600_000L)
+            sessionWh += avg * capped / 1000f / 3600f
+        }
+        sessionPeak = max(sessionPeak, magnitude)
+        sessionSum += magnitude
+        sessionCount++
+        lastSession = SessionStats(
+            charging = charging,
+            peakW = sessionPeak,
+            avgW = if (sessionCount > 0) sessionSum / sessionCount else 0f,
+            wh = sessionWh,
+            millis = now - sessionStartTs,
+            startPercent = sessionStartPercent,
+            endPercent = percent
+        )
+        lastSampleTs = now
     }
 
     // ---------------------------------------------------------------- 节点探测
