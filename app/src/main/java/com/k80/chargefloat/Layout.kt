@@ -271,12 +271,8 @@ class OverlayRenderer(private val context: Context) {
                 val text = valueOf(cfg.field, s, st, p) ?: continue
                 val color = if (cfg.color == LayoutSpec.AUTO) stateColor else cfg.color
                 if (!first) {
-                    val sep = sb.length
-                    sb.append("  ·  ")
-                    sb.setSpan(
-                        ForegroundColorSpan(0x66FFFFFF),
-                        sep, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                    )
+                    // 只用空格隔开，去掉原来的「·」，让各段靠得更紧
+                    sb.append(" ")
                     key.append('|')
                 }
                 val start = sb.length
