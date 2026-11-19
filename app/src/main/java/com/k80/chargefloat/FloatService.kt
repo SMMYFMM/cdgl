@@ -13,6 +13,7 @@ import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Point
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
@@ -174,7 +175,11 @@ class FloatService : Service() {
         bg.removeCallbacksAndMessages(null)
         prefs.raw().unregisterOnSharedPreferenceChangeListener(prefsWatcher)
         runCatching { unregisterReceiver(screenReceiver) }
-        root?.let { v -> runCatching { wm.removeView(v) } }
+        root?.let { v ->
+            // 停止服务前再存一次，防止最后一次拖动没收到 ACTION_UP
+            lp?.let { prefs.savePosition(it.x, it.y) }
+            runCatching { wm.removeView(v) }
+        }
         root = null
         PowerBus.clear()
         worker.quitSafely()
@@ -201,21 +206,41 @@ class FloatService : Service() {
             )
         )
 
-        val dm = resources.displayMetrics
+        val screen = screenSize()
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = if (prefs.posX >= 0) prefs.posX.coerceIn(0, (dm.widthPixels - dp(60)).coerceAtLeast(0))
-            else (dm.widthPixels - dp(150)).coerceAtLeast(0)
-            y = if (prefs.posY >= 0) prefs.posY.coerceIn(0, (dm.heightPixels - dp(60)).coerceAtLeast(0))
-            else dp(120)
+
+            // 不设这两个，系统会把窗口限制在状态栏和导航栏之间
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+            if (Build.VERSION.SDK_INT >= 30) {
+                setFitInsetsTypes(0)
+                setFitInsetsSides(0)
+                setFitInsetsIgnoringVisibility(true)
+            }
+
+            if (prefs.hasPosition) {
+                // 不能用 x >= 0 判断：贴左边缘时 x 是负的
+                x = prefs.posX.coerceIn(-screen.x / 2, (screen.x - dp(24)).coerceAtLeast(0))
+                y = prefs.posY.coerceIn(0, (screen.y - dp(24)).coerceAtLeast(0))
+            } else {
+                x = (screen.x - dp(150)).coerceAtLeast(0)
+                y = dp(120)
+            }
         }
 
         applyBackground(container)
@@ -257,11 +282,11 @@ class FloatService : Service() {
                         val dy = (e.rawY - touchY).toInt()
                         if (!moved && (abs(dx) > dp(6) || abs(dy) > dp(6))) moved = true
                         if (moved && !prefs.locked) {
-                            val dm = resources.displayMetrics
+                            val screen = screenSize()
                             val minX = -v.width / 3
                             val minY = 0
-                            val maxX = (dm.widthPixels - v.width / 3).coerceAtLeast(minX)
-                            val maxY = (dm.heightPixels - v.height / 3).coerceAtLeast(minY)
+                            val maxX = (screen.x - v.width / 3).coerceAtLeast(minX)
+                            val maxY = (screen.y - v.height / 3).coerceAtLeast(minY)
                             params.x = (startX + dx).coerceIn(minX, maxX)
                             params.y = (startY + dy).coerceIn(minY, maxY)
                             runCatching { wm.updateViewLayout(v, params) }
@@ -275,8 +300,15 @@ class FloatService : Service() {
                             prefs.showDetail = !prefs.showDetail
                             lastSnapshot?.let { draw(it, PowerBus.stats) }
                         } else if (!prefs.locked) {
-                            prefs.posX = params.x
-                            prefs.posY = params.y
+                            prefs.savePosition(params.x, params.y)
+                        }
+                        return true
+                    }
+
+                    MotionEvent.ACTION_CANCEL -> {
+                        // 拖到边缘时可能被系统手势打断，收不到 ACTION_UP，这里也要存
+                        if (moved && !prefs.locked) {
+                            prefs.savePosition(params.x, params.y)
                         }
                         return true
                     }
@@ -303,6 +335,19 @@ class FloatService : Service() {
             setColor(Color.argb((alphaPercent * 255 / 100).coerceIn(0, 255), 8, 8, 12))
             setStroke(dp(1), 0x22FFFFFF)
         }
+    }
+
+    /** 包含状态栏、导航栏和挖孔区域的真实屏幕尺寸 */
+    private fun screenSize(): Point {
+        val p = Point()
+        if (Build.VERSION.SDK_INT >= 30) {
+            val b = wm.maximumWindowMetrics.bounds
+            p.set(b.width(), b.height())
+        } else {
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealSize(p)
+        }
+        return p
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()

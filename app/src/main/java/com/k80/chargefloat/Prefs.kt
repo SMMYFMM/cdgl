@@ -89,7 +89,7 @@ class Prefs(context: Context) {
         get() = sp.getInt("sample_ms", 1000)
         set(value) = sp.edit().putInt("sample_ms", value).apply()
 
-    /** 悬浮窗位置，-1 表示还没设置过 */
+    /** 悬浮窗位置 */
     var posX: Int
         get() = sp.getInt("pos_x", -1)
         set(value) = sp.edit().putInt("pos_x", value).apply()
@@ -97,6 +97,18 @@ class Prefs(context: Context) {
     var posY: Int
         get() = sp.getInt("pos_y", -1)
         set(value) = sp.edit().putInt("pos_y", value).apply()
+
+    /**
+     * 是否保存过位置。
+     * 不能用 -1 判断：拖到屏幕左边缘时 x 本来就是负数，会被误认为“没设置过”。
+     */
+    val hasPosition: Boolean
+        get() = sp.contains("pos_x") && sp.contains("pos_y")
+
+    /** 一次写入 x/y，并用 commit 落盘，避免刚拖完就关服务时丢位置 */
+    fun savePosition(x: Int, y: Int) {
+        sp.edit().putInt("pos_x", x).putInt("pos_y", y).commit()
+    }
 
     /** 优先用 root 读取 sysfs（无 root 自动忽略） */
     var useRoot: Boolean
