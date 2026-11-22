@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Point
@@ -21,10 +22,12 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.LinearLayout
 import androidx.core.app.NotificationCompat
@@ -73,6 +76,12 @@ class FloatService : Service() {
     private var interactive = true
 
     private var lastSnapshot: Snapshot? = null
+
+    /** 拖动中：暂停重绘，避免和窗口移动抢主线程 */
+    private var dragging = false
+
+    /** 缓存的状态栏高度，配置变化时清空 */
+    private var cachedStatusBar = 0
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -188,6 +197,12 @@ class FloatService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 横竖屏的状态栏高度不一样，重新取
+        cachedStatusBar = 0
+    }
+
     // ---------------------------------------------------------------- 悬浮窗
 
     private fun showOverlay() {
@@ -233,13 +248,15 @@ class FloatService : Service() {
                 setFitInsetsIgnoringVisibility(true)
             }
 
+            // 顶部最低停在状态栏下方：进入状态栏区域后触摸会被状态栏截走，窗口就再也拖不下来了
+            val top = statusBarHeight()
             if (prefs.hasPosition) {
                 // 不能用 x >= 0 判断：贴左边缘时 x 是负的
                 x = prefs.posX.coerceIn(-screen.x / 2, (screen.x - dp(24)).coerceAtLeast(0))
-                y = prefs.posY.coerceIn(0, (screen.y - dp(24)).coerceAtLeast(0))
+                y = prefs.posY.coerceIn(top, (screen.y - dp(24)).coerceAtLeast(top))
             } else {
                 x = (screen.x - dp(150)).coerceAtLeast(0)
-                y = dp(120)
+                y = maxOf(dp(120), top)
             }
         }
 
@@ -265,6 +282,11 @@ class FloatService : Service() {
             private var touchX = 0f
             private var touchY = 0f
             private var moved = false
+            private var minX = 0
+            private var maxX = 0
+            private var minY = 0
+            private var maxY = 0
+            private var lastApply = 0L
 
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.actionMasked) {
@@ -274,42 +296,71 @@ class FloatService : Service() {
                         touchX = e.rawX
                         touchY = e.rawY
                         moved = false
+                        lastApply = 0L
+
+                        // 屏幕尺寸和边界只在按下时算一次。
+                        // screenSize() 内部是 maximumWindowMetrics，走 Binder，
+                        // 每帧调一次会让拖动明显发涩。
+                        val screen = screenSize()
+                        val top = statusBarHeight()
+                        minX = -v.width / 3
+                        maxX = (screen.x - v.width / 3).coerceAtLeast(minX)
+                        minY = top
+                        maxY = (screen.y - v.height / 3).coerceAtLeast(minY)
                         return true
                     }
 
                     MotionEvent.ACTION_MOVE -> {
                         val dx = (e.rawX - touchX).toInt()
                         val dy = (e.rawY - touchY).toInt()
-                        if (!moved && (abs(dx) > dp(6) || abs(dy) > dp(6))) moved = true
+                        if (!moved && (abs(dx) > dp(5) || abs(dy) > dp(5))) {
+                            moved = true
+                            dragging = true
+                        }
                         if (moved && !prefs.locked) {
-                            val screen = screenSize()
-                            val minX = -v.width / 3
-                            val minY = 0
-                            val maxX = (screen.x - v.width / 3).coerceAtLeast(minX)
-                            val maxY = (screen.y - v.height / 3).coerceAtLeast(minY)
-                            params.x = (startX + dx).coerceIn(minX, maxX)
-                            params.y = (startY + dy).coerceIn(minY, maxY)
-                            runCatching { wm.updateViewLayout(v, params) }
+                            // 高刷屏的触摸报点比屏幕刷新快，合并到约 120Hz 再提交
+                            val now = SystemClock.uptimeMillis()
+                            if (lastApply != 0L && now - lastApply < 8L) return true
+                            lastApply = now
+
+                            val targetX = startX + dx
+                            val targetY = startY + dy
+                            val cx = targetX.coerceIn(minX, maxX)
+                            val cy = targetY.coerceIn(minY, maxY)
+                            // 顶到边界后把基准一起拉回，否则手指离开边界时窗口要先"追"一段才动
+                            if (cx != targetX) startX += targetX - cx
+                            if (cy != targetY) startY += targetY - cy
+
+                            params.x = cx
+                            params.y = cy
+                            try {
+                                wm.updateViewLayout(v, params)
+                            } catch (_: Throwable) {
+                            }
                         }
                         return true
                     }
 
                     MotionEvent.ACTION_UP -> {
+                        dragging = false
                         if (!moved) {
                             // 单击：折叠成只显示第一行
                             prefs.showDetail = !prefs.showDetail
-                            lastSnapshot?.let { draw(it, PowerBus.stats) }
                         } else if (!prefs.locked) {
                             prefs.savePosition(params.x, params.y)
                         }
+                        // 拖动期间跳过了重绘，这里补一次
+                        lastSnapshot?.let { draw(it, PowerBus.stats) }
                         return true
                     }
 
                     MotionEvent.ACTION_CANCEL -> {
                         // 拖到边缘时可能被系统手势打断，收不到 ACTION_UP，这里也要存
+                        dragging = false
                         if (moved && !prefs.locked) {
                             prefs.savePosition(params.x, params.y)
                         }
+                        lastSnapshot?.let { draw(it, PowerBus.stats) }
                         return true
                     }
                 }
@@ -320,6 +371,8 @@ class FloatService : Service() {
 
     private fun draw(s: Snapshot, st: SessionStats) {
         if (!active) return
+        // 拖动中不重排窗口：此时每帧都在移动，重排会抢主线程造成掉帧
+        if (dragging) return
         val cfg = spec ?: return
         if (renderer.render(s, st, prefs, cfg, !prefs.showDetail)) relayout()
     }
@@ -333,8 +386,23 @@ class FloatService : Service() {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = dp(12).toFloat()
             setColor(Color.argb((alphaPercent * 255 / 100).coerceIn(0, 255), 8, 8, 12))
-            setStroke(dp(1), 0x22FFFFFF)
         }
+    }
+
+    /** 状态栏高度。窗口顶部不能高于这里，否则触摸会被状态栏截走，窗口就拖不下来了 */
+    private fun statusBarHeight(): Int {
+        if (cachedStatusBar > 0) return cachedStatusBar
+        val h = runCatching {
+            if (Build.VERSION.SDK_INT >= 30) {
+                wm.currentWindowMetrics.windowInsets
+                    .getInsetsIgnoringVisibility(WindowInsets.Type.statusBars()).top
+            } else {
+                val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+                if (id > 0) resources.getDimensionPixelSize(id) else 0
+            }
+        }.getOrDefault(0)
+        cachedStatusBar = if (h > 0) h else dp(28)
+        return cachedStatusBar
     }
 
     /** 包含状态栏、导航栏和挖孔区域的真实屏幕尺寸 */
