@@ -89,36 +89,53 @@ class Prefs(context: Context) {
         get() = sp.getInt("sample_ms", 1000)
         set(value) = sp.edit().putInt("sample_ms", value).apply()
 
-    /** 悬浮窗位置 */
-    var posX: Int
-        get() = sp.getInt("pos_x", -1)
-        set(value) = sp.edit().putInt("pos_x", value).apply()
-
-    var posY: Int
-        get() = sp.getInt("pos_y", -1)
-        set(value) = sp.edit().putInt("pos_y", value).apply()
+    // ---------------------------------------------------------------- 位置
 
     /**
-     * 是否保存过位置。
-     * 不能用 -1 判断：拖到屏幕左边缘时 x 本来就是负数，会被误认为“没设置过”。
+     * 横竖屏各存一套位置。两边的画布尺寸完全不同（宽度互换），
+     * 共用一套坐标会让窗口在旋转后落到莫名其妙的地方。
+     * y 一律以屏幕物理顶端为原点（v3 坐标）。
      */
-    val hasPosition: Boolean
-        get() = sp.contains("pos_x") && sp.contains("pos_y")
+    fun hasPosition(landscape: Boolean): Boolean =
+        sp.contains(keyX(landscape)) && sp.contains(keyY(landscape))
+
+    /** 返回 [x, y]，没存过返回 null */
+    fun loadPosition(landscape: Boolean): IntArray? {
+        if (!hasPosition(landscape)) return null
+        return intArrayOf(sp.getInt(keyX(landscape), 0), sp.getInt(keyY(landscape), 0))
+    }
 
     /** 一次写入 x/y，并用 commit 落盘，避免刚拖完就关服务时丢位置 */
-    fun savePosition(x: Int, y: Int) {
-        sp.edit().putInt("pos_x", x).putInt("pos_y", y).commit()
+    fun savePosition(x: Int, y: Int, landscape: Boolean) {
+        sp.edit().putInt(keyX(landscape), x).putInt(keyY(landscape), y).commit()
     }
+
+    private fun keyX(landscape: Boolean) = if (landscape) "pos_x_l" else "pos_x_p"
+
+    private fun keyY(landscape: Boolean) = if (landscape) "pos_y_l" else "pos_y_p"
+
+    /** v3 之前的单套坐标，只在首次启动时用于迁移 */
+    val legacyPosition: IntArray?
+        get() = if (sp.contains("pos_x") && sp.contains("pos_y")) {
+            intArrayOf(sp.getInt("pos_x", 0), sp.getInt("pos_y", 0))
+        } else {
+            null
+        }
 
     /**
      * 位置坐标版本。
-     * v1（默认）：y 以屏幕物理顶端为原点
-     * v2：y 以状态栏下边缘为原点（窗口改为由系统避让状态栏后，坐标系随之改变）
-     * 首次启动时做一次换算，之后不再变，避免每次启动都偏移。
+     * v1：y 以屏幕物理顶端为原点
+     * v2：y 以状态栏下边缘为原点（窗口交给系统避让状态栏后坐标系改变）
+     * v3：y 回到屏幕物理顶端，且横竖屏分库存放
+     * 每次升级只换算一次，之后不再变，避免每次启动都偏移。
      */
     var coordV2: Boolean
         get() = sp.getBoolean("coord_v2", false)
         set(value) = sp.edit().putBoolean("coord_v2", value).apply()
+
+    var coordV3: Boolean
+        get() = sp.getBoolean("coord_v3", false)
+        set(value) = sp.edit().putBoolean("coord_v3", value).apply()
 
     /** 优先用 root 读取 sysfs（无 root 自动忽略） */
     var useRoot: Boolean

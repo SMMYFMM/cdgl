@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -52,6 +53,12 @@ class FloatService : Service() {
         /** 息屏后的采样间隔 */
         private const val IDLE_SAMPLE_MS = 20_000L
 
+        /**
+         * 窗口钻进状态栏时，至少保留这么多 dp 露在状态栏下方。
+         * 太小手指点不到，太大会让折叠成单行时几乎没有可上移的空间。
+         */
+        private const val MIN_VISIBLE_DP = 12
+
         @Volatile
         var running = false
             private set
@@ -80,8 +87,24 @@ class FloatService : Service() {
     /** 拖动中：暂停重绘，避免和窗口移动抢主线程 */
     private var dragging = false
 
-    /** 缓存的状态栏高度，配置变化时清空 */
-    private var cachedStatusBar = 0
+    /** 当前窗口所在的方向，决定位置存到哪一套 */
+    private var landscape = false
+
+    /** Service 不声明 configChanges，onConfigurationChanged 不会回调，需要自己注册 */
+    private val configCallbacks = object : ComponentCallbacks {
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            val now = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
+            if (now == landscape) return
+            // 先把旧方向的坐标落到它自己的库里，再切到另一套
+            lp?.let { prefs.savePosition(it.x, it.y, landscape) }
+            landscape = now
+            // 等一帧：配置回调里 maximumWindowMetrics 可能还是旋转前的尺寸
+            ui.post { relocateForOrientation() }
+        }
+
+        @Suppress("OVERRIDE_DEPRECATION")
+        override fun onLowMemory() = Unit
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -100,8 +123,10 @@ class FloatService : Service() {
     }
 
     private val prefsWatcher = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        // 位置落盘会触发一次回调，这种情况不需要重排版
-        if (key == "pos_x" || key == "pos_y" || key == "coord_v2") {
+        // 位置落盘会触发回调，这些不影响排版
+        if (key == "pos_x_p" || key == "pos_y_p" || key == "pos_x_l" || key == "pos_y_l" ||
+            key == "coord_v2" || key == "coord_v3"
+        ) {
             return@OnSharedPreferenceChangeListener
         }
         spec = LayoutSpec.load(prefs)
@@ -146,8 +171,10 @@ class FloatService : Service() {
         worker = HandlerThread("power-sampler").also { it.start() }
         bg = Handler(worker.looper)
         interactive = (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
+        landscape = isLandscape()
         createChannel()
         prefs.raw().registerOnSharedPreferenceChangeListener(prefsWatcher)
+        registerComponentCallbacks(configCallbacks)
         ContextCompat.registerReceiver(
             this,
             screenReceiver,
@@ -187,10 +214,11 @@ class FloatService : Service() {
         running = false
         bg.removeCallbacksAndMessages(null)
         prefs.raw().unregisterOnSharedPreferenceChangeListener(prefsWatcher)
+        unregisterComponentCallbacks(configCallbacks)
         runCatching { unregisterReceiver(screenReceiver) }
         root?.let { v ->
             // 停止服务前再存一次，防止最后一次拖动没收到 ACTION_UP
-            lp?.let { prefs.savePosition(it.x, it.y) }
+            lp?.let { prefs.savePosition(it.x, it.y, landscape) }
             runCatching { wm.removeView(v) }
         }
         root = null
@@ -200,12 +228,6 @@ class FloatService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // 横竖屏的状态栏高度不一样，重新取
-        cachedStatusBar = 0
-    }
 
     // ---------------------------------------------------------------- 悬浮窗
 
@@ -227,47 +249,56 @@ class FloatService : Service() {
         )
 
         val screen = screenSize()
-        val bar = statusBarHeight()
-        // 坐标系以状态栏下边缘为原点，可用高度要扣掉状态栏
-        val maxY = (screen.y - bar - dp(24)).coerceAtLeast(0)
+        val bar = visibleStatusBarHeight()
+
+        // v3 之前只有一套坐标，且 v2 的 y 以状态栏下沿为原点。
+        // 这里统一换算成「物理屏幕顶端为原点」的竖屏坐标，之后不再动。
+        if (!prefs.coordV3) {
+            val legacy = prefs.legacyPosition
+            if (legacy != null && !prefs.hasPosition(false)) {
+                val physY = if (prefs.coordV2) legacy[1] + bar else legacy[1]
+                prefs.savePosition(legacy[0], physY, landscape = false)
+            }
+            prefs.coordV3 = true
+        }
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
 
             if (Build.VERSION.SDK_INT >= 28) {
+                // 挖孔在屏幕顶部，SHORT_EDGES 只放行左右两侧，
+                // 想要真正贴到物理顶端必须用 ALWAYS（API 30 起才有）
                 layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
             }
             if (Build.VERSION.SDK_INT >= 30) {
-                // 只避让状态栏，交给系统顶住：窗口正好贴在状态栏下沿，不会留白；
-                // 也不会因为越过状态栏被系统判成“遮挡”而收走。
-                // 导航栏不避让，底部仍然可以拖到底。
-                setFitInsetsTypes(WindowInsets.Type.statusBars())
-                setFitInsetsSides(WindowInsets.Side.TOP)
-                setFitInsetsIgnoringVisibility(true)
+                // 不再交给系统避让：窗口牢牢钉在「物理左上角」这个坐标系里。
+                // 状态栏占多少空间由 minY 自己算，这样状态栏一隐藏
+                // （横屏游戏、全屏视频）窗口就能立刻贴到真正的屏幕顶端。
+                setFitInsetsTypes(0)
             }
 
-            if (prefs.hasPosition) {
-                // 旧版本 y 以屏幕物理顶端为原点，这里换算一次
-                val rawY = if (prefs.coordV2) prefs.posY else (prefs.posY - bar).coerceAtLeast(0)
-                x = prefs.posX.coerceIn(-screen.x / 2, (screen.x - dp(24)).coerceAtLeast(0))
-                y = rawY.coerceIn(0, maxY)
-                if (!prefs.coordV2) {
-                    prefs.coordV2 = true
-                    prefs.savePosition(x, y)
-                }
+            val saved = prefs.loadPosition(landscape)
+            if (saved != null) {
+                x = saved[0].coerceIn(-screen.x / 2, (screen.x - dp(24)).coerceAtLeast(0))
+                y = saved[1].coerceIn(0, (screen.y - dp(24)).coerceAtLeast(0))
             } else {
+                // 这个方向还没有记录：靠右上放，横屏时正好避开游戏的操作区
                 x = (screen.x - dp(150)).coerceAtLeast(0)
-                y = dp(120).coerceAtMost(maxY)
-                prefs.coordV2 = true
-                prefs.savePosition(x, y)
+                y = if (landscape) dp(36) else bar + dp(120)
+                prefs.savePosition(x, y, landscape)
             }
         }
 
@@ -316,13 +347,11 @@ class FloatService : Service() {
                         // 屏幕尺寸和边界只在按下时算一次。
                         // screenSize() 内部是 maximumWindowMetrics，走 Binder，
                         // 每帧调一次会让拖动明显发涩。
-                        val screen = screenSize()
-                        val bar = statusBarHeight()
-                        minX = -v.width / 3
-                        maxX = (screen.x - v.width / 3).coerceAtLeast(minX)
-                        // y 原点就是状态栏下沿，顶部直接取 0
-                        minY = 0
-                        maxY = (screen.y - bar - v.height / 3).coerceAtLeast(minY)
+                        val b = dragBounds(v)
+                        minX = b[0]
+                        maxX = b[1]
+                        minY = b[2]
+                        maxY = b[3]
                         return true
                     }
 
@@ -381,7 +410,7 @@ class FloatService : Service() {
                             // 单击：折叠成只显示第一行
                             prefs.showDetail = !prefs.showDetail
                         } else if (!prefs.locked) {
-                            prefs.savePosition(params.x, params.y)
+                            prefs.savePosition(params.x, params.y, landscape)
                         }
                         // 拖动期间跳过了重绘，这里补一次
                         lastSnapshot?.let { draw(it, PowerBus.stats) }
@@ -392,7 +421,7 @@ class FloatService : Service() {
                         // 拖到边缘时可能被系统手势打断，收不到 ACTION_UP，这里也要存
                         dragging = false
                         if (moved && !prefs.locked) {
-                            prefs.savePosition(params.x, params.y)
+                            prefs.savePosition(params.x, params.y, landscape)
                         }
                         lastSnapshot?.let { draw(it, PowerBus.stats) }
                         return true
@@ -423,20 +452,76 @@ class FloatService : Service() {
         }
     }
 
-    /** 状态栏高度。窗口由系统避让状态栏，这里只用来算可用高度和旧坐标换算 */
-    private fun statusBarHeight(): Int {
-        if (cachedStatusBar > 0) return cachedStatusBar
+    /**
+     * 状态栏此刻实际占用的高度。
+     * 用 getInsets 而不是 getInsetsIgnoringVisibility：状态栏隐藏时返回 0，
+     * 窗口才能真的贴到物理顶端（横屏游戏、全屏视频）。
+     * 查询失败（部分 ROM 对 Service 上下文不返回 metrics）时退回资源里的固定值，
+     * 否则会误判成 0，竖屏也贴到顶上去。
+     */
+    private fun visibleStatusBarHeight(): Int {
         val h = runCatching {
             if (Build.VERSION.SDK_INT >= 30) {
                 wm.currentWindowMetrics.windowInsets
-                    .getInsetsIgnoringVisibility(WindowInsets.Type.statusBars()).top
+                    .getInsets(WindowInsets.Type.statusBars()).top
             } else {
-                val id = resources.getIdentifier("status_bar_height", "dimen", "android")
-                if (id > 0) resources.getDimensionPixelSize(id) else 0
+                -1
             }
-        }.getOrDefault(0)
-        cachedStatusBar = if (h > 0) h else dp(28)
-        return cachedStatusBar
+        }.getOrDefault(-1)
+        if (h >= 0) return h
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else 0
+    }
+
+    /**
+     * 拖动边界，y 以屏幕物理顶端为原点。
+     *
+     * 竖屏状态栏可见时也能一路往上拖，最多钻到「只露 [MIN_VISIBLE_DP] 在状态栏下方」为止。
+     * 这条下限是死线：再往上窗口就整条被时间和图标盖住，手指够不着，
+     * 再也拖不出来，只能去设置里重置位置。
+     */
+    private fun dragBounds(v: View): IntArray {
+        val screen = screenSize()
+        val bar = visibleStatusBarHeight()
+        val w = v.width.takeIf { it > 0 } ?: v.measuredWidth
+        val h = v.height.takeIf { it > 0 } ?: v.measuredHeight
+        val minX = -w / 3
+        val maxX = (screen.x - w / 3).coerceAtLeast(minX)
+        val lift = minOf(bar, (h - dp(MIN_VISIBLE_DP)).coerceAtLeast(0))
+        val minY = (bar - lift).coerceAtLeast(0)
+        val maxY = (screen.y - h / 3).coerceAtLeast(minY)
+        return intArrayOf(minX, maxX, minY, maxY)
+    }
+
+    private fun isLandscape(): Boolean =
+        resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    /** 旋转后把窗口挪到目标方向自己那套坐标上，两边的画布尺寸不一样 */
+    private fun relocateForOrientation(retry: Int = 2) {
+        if (!active) return
+        val v = root ?: return
+        val p = lp ?: return
+        val screen = screenSize()
+        // 刚转过去时 maximumWindowMetrics 可能还是旧方向的尺寸，
+        // 宽高关系对不上就再等一会儿，否则会按错误的画布夹紧坐标
+        if (screen.x != screen.y && (screen.x > screen.y) != landscape && retry > 0) {
+            ui.postDelayed({ relocateForOrientation(retry - 1) }, 100)
+            return
+        }
+        val bar = visibleStatusBarHeight()
+        val w = v.width.takeIf { it > 0 } ?: v.measuredWidth
+        val h = v.height.takeIf { it > 0 } ?: v.measuredHeight
+        // 旋转会把拖动手势打断，不收尾的话 dragging 会一直为 true，界面再也不刷新
+        dragging = false
+        val saved = prefs.loadPosition(landscape)
+        val defX = (screen.x - dp(150)).coerceAtLeast(0)
+        val defY = if (landscape) dp(36) else bar + dp(120)
+        p.x = (saved?.get(0) ?: defX).coerceIn(
+            -w / 3, (screen.x - w / 3).coerceAtLeast(-w / 3)
+        )
+        p.y = (saved?.get(1) ?: defY).coerceIn(0, (screen.y - h / 3).coerceAtLeast(0))
+        runCatching { wm.updateViewLayout(v, p) }
+        if (saved == null) prefs.savePosition(p.x, p.y, landscape)
     }
 
     /** 包含状态栏、导航栏和挖孔区域的真实屏幕尺寸 */
