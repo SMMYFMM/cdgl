@@ -215,7 +215,8 @@ class FloatService : Service() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.START
-            setPadding(dp(10), dp(5), dp(10), dp(6))
+            // 顶部只留 2dp：窗口已经贴着状态栏下沿，内边距再大就会显得离状态栏很远
+            setPadding(dp(10), dp(2), dp(10), dp(4))
         }
         container.addView(
             renderer.view,
@@ -287,10 +288,12 @@ class FloatService : Service() {
 
     private fun attachDrag(view: View, params: WindowManager.LayoutParams) {
         view.setOnTouchListener(object : View.OnTouchListener {
-            private var startX = 0
-            private var startY = 0
-            private var touchX = 0f
-            private var touchY = 0f
+            private var downRawX = 0f
+            private var downRawY = 0f
+            private var lastRawX = 0f
+            private var lastRawY = 0f
+            private var accX = 0f
+            private var accY = 0f
             private var moved = false
             private var minX = 0
             private var maxX = 0
@@ -301,10 +304,12 @@ class FloatService : Service() {
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
-                        startX = params.x
-                        startY = params.y
-                        touchX = e.rawX
-                        touchY = e.rawY
+                        downRawX = e.rawX
+                        downRawY = e.rawY
+                        lastRawX = e.rawX
+                        lastRawY = e.rawY
+                        accX = 0f
+                        accY = 0f
                         moved = false
                         lastApply = 0L
 
@@ -322,35 +327,49 @@ class FloatService : Service() {
                     }
 
                     MotionEvent.ACTION_MOVE -> {
-                        val dx = (e.rawX - touchX).toInt()
-                        val dy = (e.rawY - touchY).toInt()
-                        if (!moved && (abs(dx) > dp(5) || abs(dy) > dp(5))) {
+                        if (!moved) {
+                            if (abs(e.rawX - downRawX) <= dp(5) && abs(e.rawY - downRawY) <= dp(5)) {
+                                return true
+                            }
+                            // 从触发拖动的这一刻开始计增量，起手时窗口不会跳一下
                             moved = true
                             dragging = true
+                            lastRawX = e.rawX
+                            lastRawY = e.rawY
+                            accX = 0f
+                            accY = 0f
+                            return true
                         }
-                        if (moved && !prefs.locked) {
-                            // 高刷屏的触摸报点比屏幕刷新快，合并到约 120Hz 再提交
-                            val now = SystemClock.uptimeMillis()
-                            if (lastApply != 0L && now - lastApply < 8L) return true
-                            lastApply = now
+                        if (prefs.locked) return true
 
-                            val targetX = startX + dx
-                            val targetY = startY + dy
-                            val cx = targetX.coerceIn(minX, maxX)
-                            val cy = targetY.coerceIn(minY, maxY)
-                            // 顶到边界后把基准一起拉回，否则手指离开边界时窗口要先"追"一段才动
-                            if (cx != targetX) startX += targetX - cx
-                            if (cy != targetY) startY += targetY - cy
+                        // 高刷屏的触摸报点比屏幕刷新快，合并到约 120Hz 再提交
+                        val now = SystemClock.uptimeMillis()
+                        if (lastApply != 0L && now - lastApply < 8L) return true
+                        lastApply = now
 
-                            // 位置真变了才提交：按住不动时手指的微小抖动会不断触发 MOVE，
-                            // 无意义的重排既费电，也可能让窗口在系统侧反复重建而闪烁
-                            if (params.x != cx || params.y != cy) {
-                                params.x = cx
-                                params.y = cy
-                                try {
-                                    wm.updateViewLayout(v, params)
-                                } catch (_: Throwable) {
-                                }
+                        // 用增量推进，不用「起点 + 总位移」：
+                        // 顶到边界时超出的部分直接丢掉，不会把基准越积越偏。
+                        // 之前累加基准的写法在顶部持续抖动时会让基准跑到整数边界，
+                        // 溢出后窗口会一下子跳到屏幕最下方。
+                        accX += e.rawX - lastRawX
+                        accY += e.rawY - lastRawY
+                        lastRawX = e.rawX
+                        lastRawY = e.rawY
+                        val stepX = accX.toInt()
+                        val stepY = accY.toInt()
+                        accX -= stepX
+                        accY -= stepY
+
+                        // 位置真变了才提交：按住不动时手指的微小抖动会不断触发 MOVE，
+                        // 无意义的重排既费电，也可能让窗口在系统侧反复重建而闪烁
+                        val nx = (params.x + stepX).coerceIn(minX, maxX)
+                        val ny = (params.y + stepY).coerceIn(minY, maxY)
+                        if (nx != params.x || ny != params.y) {
+                            params.x = nx
+                            params.y = ny
+                            try {
+                                wm.updateViewLayout(v, params)
+                            } catch (_: Throwable) {
                             }
                         }
                         return true
