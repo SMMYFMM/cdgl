@@ -110,6 +110,16 @@ class Prefs(context: Context) {
         sp.edit().putInt("pos_x", x).putInt("pos_y", y).commit()
     }
 
+    /**
+     * 位置坐标版本。
+     * v1（默认）：y 以屏幕物理顶端为原点
+     * v2：y 以状态栏下边缘为原点（窗口改为由系统避让状态栏后，坐标系随之改变）
+     * 首次启动时做一次换算，之后不再变，避免每次启动都偏移。
+     */
+    var coordV2: Boolean
+        get() = sp.getBoolean("coord_v2", false)
+        set(value) = sp.edit().putBoolean("coord_v2", value).apply()
+
     /** 优先用 root 读取 sysfs（无 root 自动忽略） */
     var useRoot: Boolean
         get() = sp.getBoolean("use_root", false)

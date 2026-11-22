@@ -99,7 +99,11 @@ class FloatService : Service() {
         }
     }
 
-    private val prefsWatcher = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+    private val prefsWatcher = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        // 位置落盘会触发一次回调，这种情况不需要重排版
+        if (key == "pos_x" || key == "pos_y" || key == "coord_v2") {
+            return@OnSharedPreferenceChangeListener
+        }
         spec = LayoutSpec.load(prefs)
         ui.post {
             if (!active) return@post
@@ -222,41 +226,47 @@ class FloatService : Service() {
         )
 
         val screen = screenSize()
+        val bar = statusBarHeight()
+        // 坐标系以状态栏下边缘为原点，可用高度要扣掉状态栏
+        val maxY = (screen.y - bar - dp(24)).coerceAtLeast(0)
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
 
-            // 不设这两个，系统会把窗口限制在状态栏和导航栏之间
             if (Build.VERSION.SDK_INT >= 28) {
-                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                } else {
+                layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
             }
             if (Build.VERSION.SDK_INT >= 30) {
-                setFitInsetsTypes(0)
-                setFitInsetsSides(0)
+                // 只避让状态栏，交给系统顶住：窗口正好贴在状态栏下沿，不会留白；
+                // 也不会因为越过状态栏被系统判成“遮挡”而收走。
+                // 导航栏不避让，底部仍然可以拖到底。
+                setFitInsetsTypes(WindowInsets.Type.statusBars())
+                setFitInsetsSides(WindowInsets.Side.TOP)
                 setFitInsetsIgnoringVisibility(true)
             }
 
-            // 顶部最低停在状态栏下方：进入状态栏区域后触摸会被状态栏截走，窗口就再也拖不下来了
-            val top = statusBarHeight()
             if (prefs.hasPosition) {
-                // 不能用 x >= 0 判断：贴左边缘时 x 是负的
+                // 旧版本 y 以屏幕物理顶端为原点，这里换算一次
+                val rawY = if (prefs.coordV2) prefs.posY else (prefs.posY - bar).coerceAtLeast(0)
                 x = prefs.posX.coerceIn(-screen.x / 2, (screen.x - dp(24)).coerceAtLeast(0))
-                y = prefs.posY.coerceIn(top, (screen.y - dp(24)).coerceAtLeast(top))
+                y = rawY.coerceIn(0, maxY)
+                if (!prefs.coordV2) {
+                    prefs.coordV2 = true
+                    prefs.savePosition(x, y)
+                }
             } else {
                 x = (screen.x - dp(150)).coerceAtLeast(0)
-                y = maxOf(dp(120), top)
+                y = dp(120).coerceAtMost(maxY)
+                prefs.coordV2 = true
+                prefs.savePosition(x, y)
             }
         }
 
@@ -302,11 +312,12 @@ class FloatService : Service() {
                         // screenSize() 内部是 maximumWindowMetrics，走 Binder，
                         // 每帧调一次会让拖动明显发涩。
                         val screen = screenSize()
-                        val top = statusBarHeight()
+                        val bar = statusBarHeight()
                         minX = -v.width / 3
                         maxX = (screen.x - v.width / 3).coerceAtLeast(minX)
-                        minY = top
-                        maxY = (screen.y - v.height / 3).coerceAtLeast(minY)
+                        // y 原点就是状态栏下沿，顶部直接取 0
+                        minY = 0
+                        maxY = (screen.y - bar - v.height / 3).coerceAtLeast(minY)
                         return true
                     }
 
@@ -331,11 +342,15 @@ class FloatService : Service() {
                             if (cx != targetX) startX += targetX - cx
                             if (cy != targetY) startY += targetY - cy
 
-                            params.x = cx
-                            params.y = cy
-                            try {
-                                wm.updateViewLayout(v, params)
-                            } catch (_: Throwable) {
+                            // 位置真变了才提交：按住不动时手指的微小抖动会不断触发 MOVE，
+                            // 无意义的重排既费电，也可能让窗口在系统侧反复重建而闪烁
+                            if (params.x != cx || params.y != cy) {
+                                params.x = cx
+                                params.y = cy
+                                try {
+                                    wm.updateViewLayout(v, params)
+                                } catch (_: Throwable) {
+                                }
                             }
                         }
                         return true
@@ -389,7 +404,7 @@ class FloatService : Service() {
         }
     }
 
-    /** 状态栏高度。窗口顶部不能高于这里，否则触摸会被状态栏截走，窗口就拖不下来了 */
+    /** 状态栏高度。窗口由系统避让状态栏，这里只用来算可用高度和旧坐标换算 */
     private fun statusBarHeight(): Int {
         if (cachedStatusBar > 0) return cachedStatusBar
         val h = runCatching {
